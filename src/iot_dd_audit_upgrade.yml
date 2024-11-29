@@ -1,0 +1,1430 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: CloudFormation template for certificate management and audit workflow
+
+Parameters:
+  Prefix:
+    Type: String
+    Default: 'dd-audit-update'
+    Description: Prefix to append to resource names
+
+  DaysToExpiry:
+    Type: Number
+    Default: 1470
+    Description: Number of days before certificate expiry to check
+
+  DescribeCertificateTPS:
+    Type: Number
+    Default: 10
+    Description: Transactions per second limit for DescribeCertificate API
+
+Resources:
+
+  # Dynamo DB Table
+  AuditTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Join
+        - '-'
+        - - !Ref Prefix
+          - !Select [ 2, !Split [ '/', !Ref AWS::StackId ] ]
+          - 'audit-table'
+      AttributeDefinitions:
+        - AttributeName: taskId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: taskId
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+
+  CertificatesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Join
+        - '-'
+        - - !Ref Prefix
+          - !Select [ 2, !Split [ '/', !Ref AWS::StackId ] ]
+          - 'certificates-table'
+      AttributeDefinitions:
+        - AttributeName: CertificateId
+          AttributeType: S
+        - AttributeName: ExpiryDate
+          AttributeType: N
+        - AttributeName: CertificateStatus
+          AttributeType: S
+      KeySchema:
+        - AttributeName: CertificateId
+          KeyType: HASH
+        - AttributeName: ExpiryDate
+          KeyType: RANGE
+      BillingMode: PAY_PER_REQUEST
+      GlobalSecondaryIndexes:
+        - IndexName: CertificateStatusExpiryDateIndex
+          KeySchema:
+            - AttributeName: CertificateStatus
+              KeyType: HASH
+            - AttributeName: ExpiryDate
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+
+  # S3 Bucket
+  ReportBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    Properties:
+      BucketName: !Join
+        - '-'
+        - - !Ref Prefix
+          - !Select [ 2, !Split [ '/', !Ref AWS::StackId ] ]
+          - 'bucket'
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        IgnorePublicAcls: true
+        BlockPublicPolicy: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: TransitionToIntelligentTiering
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: 30
+                StorageClass: INTELLIGENT_TIERING
+      IntelligentTieringConfigurations:
+        - Id: IntelligentTieringArchiveConfiguration
+          Status: Enabled
+          Tierings:
+            - AccessTier: ARCHIVE_ACCESS
+              Days: 90  # Transition objects to Archive Access tier after 90 days
+            - AccessTier: DEEP_ARCHIVE_ACCESS
+              Days: 180  # Transition objects to Deep Archive Access tier after 180 days
+      ObjectLockEnabled: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LoggingConfiguration: # Add this section
+        LogFilePrefix: report-bucket-logs/
+
+
+  BucketPolicy:
+    Type: 'AWS::S3::BucketPolicy'
+    Properties:
+      Bucket: !Ref ReportBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action:
+              - s3:ListBucket
+              - s3:GetBucketLocation
+            Resource: !GetAtt ReportBucket.Arn
+          - Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action:
+              - s3:PutObject
+              - s3:GetObject
+              - s3:DeleteObject
+            Resource: !Join [ '', [ !GetAtt ReportBucket.Arn, /* ] ]
+            Condition:
+              Bool:
+                aws:SecureTransport: true  # Add this condition
+
+
+
+
+  # SNS Topics
+  CertProcessingCompleteTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${Prefix}-cert-processing-complete'
+      KmsMasterKeyId: alias/aws/sns
+
+  AuditReportCompleteTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${Prefix}-audit-report-complete'
+      KmsMasterKeyId: alias/aws/sns
+
+
+  CertificateProcessingDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${Prefix}-certificate-processing-dlq.fifo'
+      FifoQueue: true
+
+  # SQS Queue
+  CertificateProcessingQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${Prefix}-certificate-processing-queue.fifo'
+      FifoQueue: true
+      KmsMasterKeyId: alias/aws/sqs
+      ContentBasedDeduplication: true
+      MessageRetentionPeriod: 1209600 # 14 days (maximum)
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt CertificateProcessingDLQ.Arn
+        maxReceiveCount: 3 # Configure as needed
+
+  CertificateProcessingQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref CertificateProcessingQueue
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !GetAtt CertificateProcessingLambdaExecutionRole.Arn
+            Action:
+              - sqs:SendMessage
+              - sqs:ReceiveMessage
+              - sqs:DeleteMessage
+              - sqs:GetQueueAttributes
+            Resource: !GetAtt CertificateProcessingQueue.Arn
+            Condition: # Add this section
+              Bool:
+                aws:SecureTransport: true
+
+  # SQS Queue Processor Lambda
+  SqsProcessCertsPushDdbLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${Prefix}-process-certs-push-ddb'
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      ReservedConcurrentExecutions: 10
+      Architectures:
+        - arm64
+      Code:
+        ZipFile: |
+          
+          # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+          # SPDX-License-Identifier: MIT-0
+          import json
+          import boto3
+          import secrets
+          import os
+          from datetime import datetime, timedelta
+          import time
+          import random
+          import logging
+          from botocore.exceptions import ClientError
+          from concurrent.futures import ThreadPoolExecutor, as_completed
+          
+          logger = logging.getLogger(__name__)
+          logger.setLevel(logging.INFO)  # Set the logging level to INFO
+          
+          dynamodb_client = boto3.client('dynamodb')
+          iot_client = boto3.client('iot')
+          sns_client = boto3.client('sns')
+          table_name = os.environ['CERTIFICATES_DYNAMODB_TABLE_NAME']
+          sns_topic_arn = os.environ['SNS_TOPIC_ARN']
+          MAX_TPS = int(os.environ['DESCRIBE_CERTIFICATE_TPS'])
+          ttl_days = int(os.environ['TTL_DAYS'])
+          
+          
+          def describe_certificate_and_prepare_item(certificate_id):
+              response = iot_client.describe_certificate(certificateId=certificate_id)
+              cert_details = response['certificateDescription']
+          
+              # Calculate TTL (time-to-live) for the certificate in DynamoDB
+              ttl_time = int((datetime.now() + timedelta(days=ttl_days)).timestamp())
+          
+              return {
+                  'CertificateId': {'S': certificate_id},
+                  'IssueDate': {'N': str(int(cert_details['creationDate'].timestamp()))},
+                  'ExpiryDate': {'N': str(int(cert_details['validity']['notAfter'].timestamp()))},
+                  'CertificateStatus': {'S': cert_details['status']},
+                  'TTL': {'N': str(ttl_time)}
+              }
+          
+          
+          def lambda_handler(event, context):
+              certificate_items = []
+              is_last_message = False
+              calls_this_second = 0
+              seen_certificate_ids = set()  # To keep track of processed certificate IDs
+          
+              for record in event['Records']:
+                  try:
+                      body = json.loads(record['body'])
+          
+                      # Check if this is the last message in the batch
+                      if body.get('isLastMessage'):
+                          logger.info("Received last message in the batch")
+                          is_last_message = True
+          
+                          # Publish a notification to SNS topic
+                          message_body = {
+                              "taskId": body['taskId']
+                          }
+                          sns_client.publish(
+                              TopicArn=sns_topic_arn,
+                              Message=json.dumps(message_body)
+                          )
+                          continue  # Skip to the next record
+          
+                      certificate_id = body['certificateId']
+          
+                      # Skip duplicate certificate IDs within the batch
+                      if certificate_id in seen_certificate_ids:
+                          logger.warning(f"Skipping duplicate certificate ID: {certificate_id}")
+                          continue
+                      else:
+                          seen_certificate_ids.add(certificate_id)
+                          logger.info(f"Processing certificate ID: {certificate_id}")
+          
+                      # Rate limiting: sleep if exceeding the allowed transactions per second
+                      if calls_this_second >= MAX_TPS:
+                          time.sleep(1 + secrets.randbelow(1000) / 1000)  # Sleep for a random time between 1 and 2 seconds
+                          calls_this_second = 0
+          
+                      # Retrieve certificate details and format for DynamoDB
+                      certificate_items.append(describe_certificate_and_prepare_item(certificate_id))
+                      calls_this_second += 1  # Increment API call counter
+          
+                  except iot_client.exceptions.ThrottlingException:
+                      # Exponential backoff for throttling exceptions
+                      backoff_time = 2 ** (calls_this_second // MAX_TPS)
+                      logger.warning(f"Rate exceeded for IoT DescribeCertificate, backing off for {backoff_time} seconds")
+                      time.sleep(backoff_time)
+          
+                  except Exception as e:
+                      logger.error(f"Error processing certificate {certificate_id}: {e}")
+          
+              # Batch write all items (if any)
+              if certificate_items:
+                  logger.info(f"Preparing to batch write {len(certificate_items)} items to DynamoDB")
+                  logger.debug(f"Certificate items: {certificate_items}")  # Log the items for inspection
+                  if len(certificate_items) > 25:
+                    raise ValueError("Batch size exceeds DynamoDB limit")
+          
+                  request_items = {
+                      table_name: [
+                          {'PutRequest': {'Item': item}} for item in certificate_items
+                      ]
+                  }
+                  try:
+                      response = dynamodb_client.batch_write_item(RequestItems=request_items)
+                      logger.info("Batch write completed successfully")
+                      if response.get('UnprocessedItems'):
+                          logger.warning(f"Unprocessed items: {response['UnprocessedItems']}")
+                  except ClientError as err:
+                      logger.error(
+                          "Couldn't load data into table %s. Here's why: %s: %s",
+                          table_name,
+                          err.response["Error"]["Code"],
+                          err.response["Error"]["Message"],
+                      )
+                      raise
+              else:
+                  logger.info("No new certificate items to write to DynamoDB")
+      Environment:
+        Variables:
+          CERTIFICATES_DYNAMODB_TABLE_NAME: !Ref CertificatesTable
+          DESCRIBE_CERTIFICATE_TPS: '10'
+          SNS_TOPIC_ARN: !Ref CertProcessingCompleteTopic
+          TTL_DAYS: '2'
+      Timeout: 10
+      Role: !GetAtt LambdaExecutionRole.Arn
+
+
+
+  # SQS Queue Processor Lambda Role
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: LambdaExecutionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:BatchWriteItem
+                Resource: !GetAtt CertificatesTable.Arn
+              - Effect: Allow
+                Action:
+                  - iot:DescribeCertificate
+                Resource: !Sub 'arn:aws:iot:${AWS::Region}:${AWS::AccountId}:cert/*'
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref CertProcessingCompleteTopic
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                Resource: !GetAtt CertificateProcessingQueue.Arn
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: arn:aws:logs:*:*:*
+
+  # SQS Queue Processor Lambda Trigger
+  LambdaSQSEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      FunctionName: !Ref SqsProcessCertsPushDdbLambda
+      EventSourceArn: !GetAtt CertificateProcessingQueue.Arn
+      BatchSize: 10
+
+  # Generate Audit Report Lambda
+  GenerateAuditReportLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${Prefix}-generate-audit-report'
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      ReservedConcurrentExecutions: 5
+      Architectures:
+        - arm64
+      Code:
+        ZipFile: |
+          
+          # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+          # SPDX-License-Identifier: MIT-0
+          
+          import boto3
+          import os
+          import datetime
+          import logging
+          import json
+          import uuid
+          
+          # Configure logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO) 
+          
+          dynamodb = boto3.client('dynamodb')
+          s3 = boto3.client('s3')
+          sns = boto3.client('sns')
+          
+          
+          def lambda_handler(event, context):
+              certificates_table_name = os.environ['CERTIFICATES_DYNAMODB_TABLE_NAME']
+              audit_table_name = os.environ['AUDIT_DYNAMODB_TABLE_NAME']
+              days_to_expiry = int(os.environ['DAYS_TO_EXPIRY'])
+              s3_bucket_name = os.environ['S3_BUCKET_NAME']
+              s3_prefix = os.environ['S3_PREFIX']
+              sns_topic_arn = os.environ['SNS_TOPIC_ARN']
+          
+              # Extract taskId from the incoming event
+              task_id = json.loads(event['Records'][0]['Sns']['Message'])['taskId']
+              logger.info(f"Starting audit report processing for task ID: {task_id}") # Log the start of processing
+          
+              now = datetime.datetime.now()
+              expiry_threshold = int((now + datetime.timedelta(days=days_to_expiry)).timestamp())
+              current_timestamp = int(now.timestamp())
+          
+              try:
+                  # 1. Query the Audit table with taskId
+                  logger.info(f"Querying Audit table for task ID: {task_id}") # Log the Audit table query
+                  audit_response = dynamodb.query(
+                      TableName=audit_table_name,
+                      KeyConditionExpression="taskId = :taskId",
+                      ExpressionAttributeValues={":taskId": {"S": task_id}}
+                  )
+          
+                  # Extract taskStartTime and findingTime from the audit response
+                  task_start_time_ms = int(audit_response['Items'][0]['taskStartTime']['N'])
+                  task_start_time = datetime.datetime.fromtimestamp(task_start_time_ms / 1000).strftime(
+                      '%Y-%m-%dT%H:%M:%S.%f+00:00')
+          
+                  # findingTime is the current timestamp
+                  finding_time = datetime.datetime.now().strftime('%Y-%m-%dT%H:%M:%S.%f+00:00')
+          
+                  # 2. Generate list of expiring and expired certificates
+                  logger.info("Generating list of expiring and expired certificates") # Log before fetching certificates
+                  expiring_certificates, expired_certificates = get_certificate_lists(
+                      certificates_table_name, days_to_expiry, current_timestamp, expiry_threshold
+                  )
+          
+                  # 3. Create the final audit report
+                  logger.info("Creating the final audit report") # Log before creating the report
+                  findings = []
+                  for cert in expiring_certificates:
+                      expiry_date_seconds = int(cert['ExpiryDate']['N'])
+                      remaining_days = (datetime.datetime.fromtimestamp(expiry_date_seconds) - now).days
+                      findings.append(create_finding(
+                          task_id, "DEVICE_CERTIFICATE_EXPIRING_CHECK", task_start_time, finding_time,
+                          cert['CertificateId']['S'], f"Certificate approaching expiration in next {remaining_days} days.",
+                          "CERTIFICATE_APPROACHING_EXPIRATION"
+                      ))
+          
+                  for cert in expired_certificates:
+                      expiry_date_ms = int(cert['ExpiryDate']['N']) * 1000
+                      findings.append(create_finding(
+                          task_id, "DEVICE_CERTIFICATE_EXPIRING_CHECK", task_start_time, finding_time,
+                          cert['CertificateId']['S'], "Certificate is past its expiration.",
+                          "CERTIFICATE_PAST_EXPIRATION",
+                          str(expiry_date_ms)
+                      ))
+          
+                  audit_report = {"findings": findings}
+                  logger.info(f"Audit report created with {len(findings)} findings") # Log the number of findings
+
+              except Exception as e:
+                  logger.error(f"Error processing audit report: {e}")
+                  raise
+          
+              # Create JSON file in /tmp
+              file_name = f"{task_id}.json"
+              file_path = os.path.join("/tmp", file_name)
+              with open(file_path, 'w') as f:
+                  json.dump(audit_report, f)
+          
+              # Upload file to S3
+              s3_key = f"{s3_prefix}/{file_name}"
+              s3.upload_file(file_path, s3_bucket_name, s3_key)
+          
+              # Update the audit table entry
+              logger.info("Updating Audit table and publishing to SNS") # Log before updating Audit table
+              total_certs_count = get_total_certs_count(certificates_table_name)
+              non_compliant = len(findings) > 0
+              sns_payload = {
+                  "accountId": audit_response['Items'][0]['accountId']['S'],  # Get from audit_response
+                  "taskId": task_id,
+                  "taskStatus": "COMPLETED",
+                  "taskType": audit_response['Items'][0]['taskType']['S'],  # Get from audit_response
+                  "failedChecksCount": 0,
+                  "canceledChecksCount": 0,
+                  "nonCompliantChecksCount": 1 if non_compliant else 0,
+                  "compliantChecksCount": 0 if non_compliant else 1,
+                  "totalChecksCount": 1,
+                  "taskStartTime": task_start_time_ms,
+                  "auditDetails": [{
+                      "checkName": "DEVICE_CERTIFICATE_EXPIRING_CHECK",
+                      "checkRunStatus": "COMPLETED_NON_COMPLIANT" if non_compliant else "COMPLETED_COMPLIANT",
+                      "nonCompliantResourcesCount": len(findings),
+                      "totalResourcesCount": total_certs_count,
+                      "suppressedNonCompliantResourceCount": 0,
+                      "resultsS3Bucket": s3_bucket_name,
+                      "resultsS3Key": s3_key
+                  }]
+              }
+          
+              update_audit_table_and_publish_sns(
+                  audit_table_name, task_id, "COMPLETED",
+                  non_compliant, len(findings), total_certs_count,
+                  s3_bucket_name, s3_key, task_start_time_ms,
+                  sns_topic_arn, sns_payload
+              )
+              logger.info(f"Audit report processing completed for task ID: {task_id}") # Log the completion of processing
+          
+          def get_certificate_lists(certificates_table_name, days_to_expiry, current_timestamp, expiry_threshold):
+              try:
+                # Query for expiring certificates
+                expiring_certificates = []
+                response = dynamodb.query(
+                    TableName=certificates_table_name,
+                    IndexName='CertificateStatusExpiryDateIndex',
+                    KeyConditionExpression="CertificateStatus = :status AND ExpiryDate BETWEEN :now AND :expiry",
+                    ExpressionAttributeValues={
+                        ":status": {"S": "ACTIVE"},
+                        ":now": {"N": str(current_timestamp)},
+                        ":expiry": {"N": str(expiry_threshold)}
+                    }
+                )
+        
+                expiring_certificates.extend(response['Items'])
+        
+                while 'LastEvaluatedKey' in response:
+                    response = dynamodb.query(
+                        TableName=certificates_table_name,
+                        IndexName='CertificateStatusExpiryDateIndex',
+                        KeyConditionExpression="CertificateStatus = :status AND ExpiryDate BETWEEN :now AND :expiry",
+                        ExpressionAttributeValues={
+                            ":status": {"S": "ACTIVE"},
+                            ":now": {"N": str(current_timestamp)},
+                            ":expiry": {"N": str(expiry_threshold)}
+                        },
+                        ExclusiveStartKey=response['LastEvaluatedKey']
+                    )
+                    expiring_certificates.extend(response['Items'])
+        
+                # Query for expired certificates (using the GSI)
+                expired_certificates = []
+                response = dynamodb.query(
+                    TableName=certificates_table_name,
+                    IndexName='CertificateStatusExpiryDateIndex',
+                    KeyConditionExpression="CertificateStatus = :status AND ExpiryDate < :now",
+                    ExpressionAttributeValues={
+                        ":status": {"S": "ACTIVE"},
+                        ":now": {"N": str(current_timestamp)}
+                    }
+                )
+        
+                expired_certificates.extend(response['Items'])
+                
+                while 'LastEvaluatedKey' in response:
+                    response = dynamodb.query(
+                        TableName=certificates_table_name,
+                        IndexName='CertificateStatusExpiryDateIndex',
+                        KeyConditionExpression="CertificateStatus = :status AND ExpiryDate < :now",
+                        ExpressionAttributeValues={
+                            ":status": {"S": "ACTIVE"},
+                            ":now": {"N": str(current_timestamp)}
+                        },
+                        ExclusiveStartKey=response['LastEvaluatedKey']
+                    )
+                    expired_certificates.extend(response['Items'])
+        
+                return expiring_certificates, expired_certificates
+          
+              except Exception as e:
+                  logger.error(f"Error querying DynamoDB: {e}")
+                  raise
+          
+          
+          def create_finding(task_id, check_name, task_start_time, finding_time, cert_id, reason, code, expiry_time=None):
+              finding = {
+                  "findingId": str(uuid.uuid4()).replace("-", ""),
+                  "taskId": task_id,
+                  "checkName": check_name,
+                  "taskStartTime": task_start_time,
+                  "findingTime": finding_time,
+                  "severity": "MEDIUM",
+                  "nonCompliantResource": {
+                      "resourceType": "DEVICE_CERTIFICATE",
+                      "resourceIdentifier": {"deviceCertificateId": cert_id}
+                  },
+                  "reasonForNonCompliance": reason,
+                  "reasonForNonComplianceCode": code,
+                  "isSuppressed": False
+              }
+              if expiry_time:
+                  finding["nonCompliantResource"]["additionalInfo"] = {"EXPIRATION_TIME": expiry_time}
+              return finding
+          
+          
+          def get_expiry_time(certificates_table_name, cert_id):
+              # Query the certificates table to get the ExpiryDate for the given cert_id
+              response = dynamodb.get_item(
+                  TableName=certificates_table_name,
+                  Key={"CertificateId": {"S": cert_id}}
+              )
+              expiry_date_seconds = int(response['Item']['ExpiryDate']['N'])
+              expiry_date_ms = expiry_date_seconds * 1000  # Convert seconds to milliseconds
+              return str(expiry_date_ms)
+          
+          
+          def get_total_certs_count(certificates_table_name):
+            total_count = 0
+            response = dynamodb.scan(TableName=certificates_table_name, Select='COUNT')
+            total_count += response['Count']
+        
+            while 'LastEvaluatedKey' in response:
+                response = dynamodb.scan(
+                    TableName=certificates_table_name,
+                    Select='COUNT',
+                    ExclusiveStartKey=response['LastEvaluatedKey']
+                )
+                total_count += response['Count']
+        
+            logger.info(f"Total certificates count: {total_count}")
+            return total_count
+          
+          
+          def update_audit_table_and_publish_sns(audit_table_name, task_id, task_status,
+                                                 non_compliant, non_compliant_count, total_certs_count,
+                                                 s3_bucket, s3_key, task_start_time_ms,
+                                                 sns_topic_arn, sns_payload):
+              update_expression = "SET taskStatus = :status, nonCompliantChecksCount = :nonCompliant, " \
+                                  "compliantChecksCount = :compliant, totalChecksCount = :total, " \
+                                  "auditDetails = :details, failedChecksCount= :failedChecksCount, canceledChecksCount = :canceledChecksCount"
+              expression_attribute_values = {
+                  ":status": {"S": task_status},
+                  ":failedChecksCount": {"N": str(0)},
+                  ":canceledChecksCount": {"N": str(0)},
+                  ":nonCompliant": {"N": str(1 if non_compliant else 0)},
+                  ":compliant": {"N": str(0 if non_compliant else 1)},
+                  ":total": {"N": "1"},
+                  ":details": {"L": [{
+                      "M": {
+                          "checkName": {"S": "DEVICE_CERTIFICATE_EXPIRING_CHECK"},
+                          "checkRunStatus": {"S": "COMPLETED_NON_COMPLIANT" if non_compliant else "COMPLETED_COMPLIANT"},
+                          "nonCompliantResourcesCount": {"N": str(non_compliant_count)},
+                          "totalResourcesCount": {"N": str(total_certs_count)},
+                          "suppressedNonCompliantResourceCount": {"N": "0"},
+                          "resultsS3Bucket": {"S": s3_bucket},
+                          "resultsS3Key": {"S": s3_key}
+                      }
+                  }]}
+              }
+          
+              dynamodb.update_item(
+                  TableName=audit_table_name,
+                  Key={
+                      "taskId": {"S": task_id}
+                  },
+                  UpdateExpression=update_expression,
+                  ExpressionAttributeValues=expression_attribute_values
+              )
+          
+              # Publish the message to SNS
+              sns.publish(
+                  TopicArn=sns_topic_arn,
+                  Message=json.dumps(sns_payload)
+              )
+
+      Environment:
+        Variables:
+          AUDIT_DYNAMODB_TABLE_NAME: !Ref AuditTable
+          CERTIFICATES_DYNAMODB_TABLE_NAME: !Ref CertificatesTable
+          DAYS_TO_EXPIRY: '1470'
+          S3_BUCKET_NAME: !Ref ReportBucket
+          S3_PREFIX: 'audit-task-findings'
+          SNS_TOPIC_ARN: !Ref AuditReportCompleteTopic
+      Timeout: 120 # Adjust timeout as needed
+      MemorySize: 2056
+      Role: !GetAtt GenerateAuditReportLambdaRole.Arn
+
+  GenerateAuditReportLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+
+      Policies:
+        - PolicyName: GenerateAuditReportLambdaPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:Query
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Scan
+                Resource:
+                  - !GetAtt AuditTable.Arn
+                  - !GetAtt CertificatesTable.Arn
+                  - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${Prefix}-certificates-table/index/CertificateStatusExpiryDateIndex"
+                  - !Join
+                    - /
+                    - - !GetAtt CertificatesTable.Arn
+                      - index/CertificateStatusExpiryDateIndex
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                Resource: !Sub 'arn:aws:s3:::${ReportBucket}/audit-task-findings/*'
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref AuditReportCompleteTopic
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: arn:aws:logs:*:*:*
+
+  GenerateAuditReportLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref GenerateAuditReportLambda
+      Action: lambda:InvokeFunction
+      Principal: sns.amazonaws.com
+      SourceArn: !Ref CertProcessingCompleteTopic
+
+  CertProcessingCompleteTopicSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: lambda
+      TopicArn: !Ref CertProcessingCompleteTopic
+      Endpoint: !GetAtt GenerateAuditReportLambda.Arn
+
+  CertificateProcessingLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${Prefix}-certificate-processing-lambda'
+      Handler: index.lambda_handler
+      ReservedConcurrentExecutions: 5
+      Role: !GetAtt CertificateProcessingLambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          
+          # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+          # SPDX-License-Identifier: MIT-0
+          
+          import json
+          import boto3
+          import os
+          import logging
+          from concurrent.futures import ThreadPoolExecutor, as_completed
+          import uuid
+          import time
+          from botocore.exceptions import ClientError
+          from botocore.config import Config
+
+          # Configure logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          # Create Clients
+          sts_client = boto3.client('sts')
+          sqs_client = boto3.client('sqs')
+          dynamodb_client = boto3.client('dynamodb')
+          config = Config(
+              retries={
+                  'max_attempts': 10,  # Increase max attempts if necessary
+                  'mode': 'adaptive'  # Use adaptive mode for optimized backoff
+              }
+          )
+          iot_client = boto3.client('iot', config=config)
+
+
+          def create_dynamodb_entry(task_id, table_name, account_id):
+          
+              if task_id is None:
+                # Generate a new task_id if it's None
+                task_id = str(uuid.uuid4())
+              
+              task_start_time = int(time.time() * 1000)
+
+              try:
+                  dynamodb_client.put_item(
+                      TableName=table_name,
+                      Item={
+                          'taskId': {'S': task_id},
+                          'taskStartTime': {'N': str(task_start_time)},
+                          'accountId': {'S': account_id},
+                          'taskStatus': {'S': 'IN_PROGRESS'},
+                          'taskType': {'S': 'ON_DEMAND_AUDIT_TASK'}
+                      }
+                  )
+                  return task_id
+              except ClientError as e:
+                  logger.error(f"Error creating DynamoDB entry: {e}")
+                  raise
+
+
+          def lambda_handler(event, context):
+              # Get environment variables
+              sqs_queue_url = os.environ.get('SQS_QUEUE_URL')
+              dynamodb_table_name = os.environ.get('AUDIT_DYNAMODB_TABLE_NAME')
+          
+              # Check for 'taskId' in the event payload
+              task_id = event.get('taskId')
+          
+              if task_id:
+                  # If 'taskId' exists, remove hyphens
+                  task_id = str(task_id)
+              else:
+                  # If 'taskId' doesn't exist, set it to None
+                  task_id = None
+              
+              if not sqs_queue_url or not dynamodb_table_name:
+                  raise ValueError("Required environment variables are not set.")
+              
+              logger.info(f"Using SQS URL: {sqs_queue_url}, DynamoDB Table: {dynamodb_table_name}")
+              
+              account_id = sts_client.get_caller_identity()['Account']
+              region = os.environ.get('AWS_REGION')
+          
+              # Create DynamoDB entry
+              task_id = create_dynamodb_entry(task_id, dynamodb_table_name, account_id)
+              logger.info(f"DynamoDB entry created for task ID: {task_id}")
+
+              # Batching and Parallel Processing
+              def send_message_batch(message_batch):
+                  try:
+                      sqs_client.send_message_batch(
+                          QueueUrl=sqs_queue_url,
+                          Entries=message_batch
+                      )
+                  except Exception as sqs_error:
+                      logger.error(f"Error sending SQS message batch: {sqs_error}")
+
+              def process_certificate(cert):
+                  certificate_id = cert['certificateId']
+                  message_body = {
+                      "certificateId": certificate_id,
+                      "isLastMessage": False
+                  }
+                  return {
+                      'Id': certificate_id,
+                      'MessageBody': json.dumps(message_body),
+                      'MessageGroupId': 'certificate_group',
+                      'MessageDeduplicationId': certificate_id
+                  }
+
+              message_batch = []
+              max_batch_size = 10  # SQS limit
+
+              try:
+                  total_certificates = 0
+                  paginator = iot_client.get_paginator('list_certificates')
+                  logger.info(f"Listed all certificates in Account: {account_id} | Region: {region}")
+                  with ThreadPoolExecutor() as executor:
+                      futures = []
+                      for page in paginator.paginate(pageSize=250):
+                          
+                          total_certificates += len(page['certificates'])
+                                
+                          for cert in page['certificates']:
+                              if cert['status'] == 'ACTIVE':
+                                  futures.append(executor.submit(process_certificate, cert))
+
+                          for future in as_completed(futures):
+                              result = future.result()
+                              if result:  # Check if result is not None (in case of errors)
+                                  message_batch.append(result)
+                              if len(message_batch) == max_batch_size:
+                                  send_message_batch(message_batch)
+                                  message_batch = []
+                          futures = []  # clear futures for next batch
+
+                  # Send remaining messages
+                  if message_batch:
+                      send_message_batch(message_batch)
+                  
+                  logger.info(f"Total number of certificates processed: {total_certificates}")
+                  logger.info(f"All certificates messages sent to SQS Queue")
+
+                  # Send "last message" indicator if there were any messages
+                  if paginator:
+                      sqs_client.send_message(
+                          QueueUrl=sqs_queue_url,
+                          MessageBody=json.dumps({"taskId": task_id, "isLastMessage": True}),
+                          MessageGroupId='certificate_group',
+                          MessageDeduplicationId='last_message'
+                      )
+                  
+                  logger.info(f"Last message sent to SQS Queue")
+
+              except Exception as iot_error:
+                  logger.error(f"Error listing IoT certificates: {iot_error}")
+                  dynamodb_client.update_item(
+                      TableName=dynamodb_table_name,
+                      Key={'taskId': {'S': task_id}},
+                      UpdateExpression="SET taskStatus = :status",
+                      ExpressionAttributeValues={":status": {"S": "FAILED"}}
+                  )
+                  raise
+
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps('Lambda execution completed')
+              }
+
+      Runtime: python3.12
+      MemorySize: 2056
+      Timeout: 900
+      Architectures:
+        - arm64
+      Environment:
+        Variables:
+          SQS_QUEUE_URL: !Ref CertificateProcessingQueue
+          AUDIT_DYNAMODB_TABLE_NAME: !Ref AuditTable
+
+  # Lambda Execution Role
+  CertificateProcessingLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                Resource: !GetAtt AuditTable.Arn
+              - Effect: Allow
+                Action:
+                  - iot:ListCertificates
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                  - sqs:SendMessageBatch
+                Resource: !GetAtt CertificateProcessingQueue.Arn
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: arn:aws:logs:*:*:*
+
+  # EventBridge Scheduler
+  CertificateProcessingSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Description: Schedule to trigger certificate processing task
+      ScheduleExpression: 'cron(0 0 1 * ? *)'
+      FlexibleTimeWindow:
+        Mode: "OFF"
+      Target:
+        Arn: !GetAtt CertificateProcessingLambda.Arn
+        RoleArn: !GetAtt EventBridgeRole.Arn
+        Input: !Sub '{}'
+
+  # EventBridge Role
+  EventBridgeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: scheduler.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: EventBridgePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'ecs:RunTask'
+                  - 'lambda:InvokeFunction'
+                Resource:
+                  - !GetAtt CertificateProcessingLambda.Arn
+
+
+  # API GW Logging Setup
+  ApiGatewayLoggingRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: apigateway.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ApiGatewayCloudWatchLogsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:DescribeLogGroups
+                  - logs:DescribeLogStreams
+                  - logs:PutLogEvents
+                  - logs:GetLogEvents
+                  - logs:FilterLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*'
+
+
+  ApiGatewayAccount:
+    DependsOn: ApiGatewayLoggingRole
+    Type: AWS::ApiGateway::Account
+    Properties:
+      # CloudWatch logging
+      CloudWatchRoleArn: !GetAtt ApiGatewayLoggingRole.Arn
+
+  # API Gateway
+  ApiGateway:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub '${Prefix}-certificate-audit-api'
+      Description: API for certificate auditing tasks
+
+  StartAuditResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ParentId: !GetAtt ApiGateway.RootResourceId
+      PathPart: 'start-audit'
+
+  StartAuditMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref StartAuditResource
+      HttpMethod: POST
+      AuthorizationType: AWS_IAM
+      Integration:
+        Type: AWS
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${CertificateProcessingLambda.Arn}/invocations'
+        PassthroughBehavior: WHEN_NO_TEMPLATES
+        RequestParameters:
+          integration.request.header.X-Amz-Invocation-Type: "'Event'"
+        RequestTemplates:
+          application/json: |
+            {
+              "taskId": "$context.requestId"
+            }
+        IntegrationResponses:
+          - StatusCode: 202
+            SelectionPattern: '.*'
+            ResponseTemplates:
+              application/json: |
+                {
+                  "task_id": "$context.requestId" 
+                }
+      MethodResponses:
+        - StatusCode: 202
+
+  GetAuditStatusResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ParentId: !GetAtt ApiGateway.RootResourceId
+      PathPart: 'get-audit-status'
+
+  GetAuditStatusResourceProxy:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ParentId: !Ref GetAuditStatusResource
+      PathPart: '{task_id}'
+
+  GetAuditStatusMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref GetAuditStatusResourceProxy
+      HttpMethod: GET
+      AuthorizationType: AWS_IAM
+      RequestParameters:
+        method.request.path.task_id: true
+
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${GetAuditStatusLambda.Arn}/invocations'
+        PassthroughBehavior: WHEN_NO_TEMPLATES
+        RequestTemplates:
+          application/json: |
+            {
+              "taskId": "$util.escapeJavaScript($input.params('task_id'))"
+            }
+
+  ListAuditFindingsResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ParentId: !GetAtt ApiGateway.RootResourceId
+      PathPart: 'list-audits'
+
+  ListAuditFindingsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref ListAuditFindingsResource
+      HttpMethod: GET
+      AuthorizationType: AWS_IAM
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ListAuditFindingsLambda.Arn}/invocations' # We'll create this Lambda next
+        PassthroughBehavior: WHEN_NO_TEMPLATES
+
+
+  # API Deployment
+  ApiDeployment:
+    DependsOn:
+      - StartAuditMethod
+      - GetAuditStatusMethod
+      - ListAuditFindingsMethod
+    Type: AWS::ApiGateway::Deployment
+    Properties:
+      RestApiId: !Ref ApiGateway
+    Metadata:
+      cdk_nag:
+        rules_to_suppress:
+          - id: AwsSolutions-APIG3
+            reason: "Not using WAF"
+          - id: AwsSolutions-COG4
+            reason: "Not using Cognito"
+
+  ApiGwLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Join
+        - '-'
+        - - !Ref Prefix
+          - !Ref ApiGateway
+          - !Select [ 2, !Split [ '/', !Ref AWS::StackId ] ]
+          - 'access-log-group'
+      RetentionInDays: 30
+
+  ApiStage:
+    Type: AWS::ApiGateway::Stage
+    DependsOn:
+        - ApiDeployment
+        - ApiGatewayLoggingRole
+    Properties:
+      RestApiId: !Ref ApiGateway
+      StageName: prod
+      DeploymentId: !Ref ApiDeployment
+      MethodSettings:
+        - HttpMethod: '*'
+          ResourcePath: '/*'
+          LoggingLevel: ERROR
+          DataTraceEnabled: true
+      AccessLogSetting:
+        DestinationArn: !GetAtt ApiGwLogGroup.Arn
+        Format: $context.extendedRequestId $context.identity.sourceIp $context.identity.caller $context.identity.user [$context.requestTime] "$context.httpMethod $context.resourcePath $context.protocol" $context.status $context.responseLength $context.requestId
+
+
+  CertificateAuditUsagePlan:
+    Type: 'AWS::ApiGateway::UsagePlan'
+    DependsOn:
+      - ApiGateway
+      - ApiStage
+    Properties:
+      ApiStages:
+        - ApiId: !Ref ApiGateway
+          Stage: prod
+      Description: Usage plan for Certificate Audit API
+      Throttle:
+        BurstLimit: 20
+        RateLimit: 10
+      Quota:
+        Limit: 10000
+        Period: MONTH
+
+  ApiGatewayInvokeLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref CertificateProcessingLambda
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ApiGateway}/*/POST/start-audit"
+
+  ApiGatewayInvokeGetAuditStatusLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref GetAuditStatusLambda
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ApiGateway}/*/GET/get-audit-status/*"
+
+  # Permission for API Gateway to invoke ListAuditFindingsLambda
+  ApiGatewayInvokeListAuditFindingsLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ListAuditFindingsLambda
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ApiGateway}/*/GET/list-audits"
+
+
+  # Lambda Function to get audit status
+  GetAuditStatusLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${Prefix}-get-audit-status-lambda'
+      Handler: index.lambda_handler
+      ReservedConcurrentExecutions: 10
+      Role: !GetAtt GetAuditStatusLambdaRole.Arn
+      Code:
+        ZipFile: |
+          
+          # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+          # SPDX-License-Identifier: MIT-0
+          
+          import boto3
+          import os
+          import json
+          from botocore.exceptions import ClientError
+          
+          dynamodb = boto3.client('dynamodb')
+          
+          def lambda_handler(event, context):
+              table_name = os.environ['AUDIT_TABLE_NAME']
+              task_id = event['pathParameters']['task_id'] # Extract and process task_id
+          
+              try:
+                  response = dynamodb.get_item(
+                      TableName=table_name,
+                      Key={
+                          'taskId': {'S': task_id}
+                      }
+                  )
+          
+                  if 'Item' in response:
+                      item = response['Item']
+                      # Process and format the DynamoDB item as needed
+                      return {
+                          'statusCode': 200,
+                          'body': json.dumps(item) 
+                      }
+                  else:
+                      return {
+                          'statusCode': 404,
+                          'body': json.dumps('Task not found')
+                      }
+          
+              except ClientError as e:
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps('Error fetching task details')
+                  }
+      Runtime: python3.12
+      Architectures:
+        - arm64
+      Environment:
+        Variables:
+          AUDIT_TABLE_NAME: !Ref AuditTable
+
+  # IAM Role for the Lambda function
+  GetAuditStatusLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: GetAuditStatusLambdaPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                Resource: !GetAtt AuditTable.Arn
+              - Effect: Allow # Add other permissions if needed (e.g., for logging)
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: arn:aws:logs:*:*:*
+
+
+  # Lambda Function to list audit findings
+  ListAuditFindingsLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${Prefix}-list-audit-findings-lambda'
+      ReservedConcurrentExecutions: 10
+      Handler: index.lambda_handler
+      Role: !GetAtt ListAuditFindingsLambdaRole.Arn
+      Code:
+        ZipFile: |
+          
+          # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+          # SPDX-License-Identifier: MIT-0
+          
+          import boto3
+          import os
+          import json
+          from botocore.exceptions import ClientError
+          
+          dynamodb = boto3.client('dynamodb')
+          
+          def lambda_handler(event, context):
+              table_name = os.environ['AUDIT_TABLE_NAME']
+          
+              try:
+                  response = dynamodb.scan(TableName=table_name) 
+          
+                  items = response.get('Items', [])
+          
+                  # Process and format the DynamoDB items as needed
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps(items)
+                  }
+          
+              except ClientError as e:
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps('Error fetching audit findings')
+                  }
+      Runtime: python3.12
+      Architectures:
+        - arm64
+      Environment:
+        Variables:
+          AUDIT_TABLE_NAME: !Ref AuditTable
+
+  ListAuditFindingsLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ListAuditFindingsLambdaPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:Scan
+                Resource: !GetAtt AuditTable.Arn
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: arn:aws:logs:*:*:*
+
+Outputs:
+  AuditTableArn:
+    Value: !GetAtt AuditTable.Arn
+    Description: ARN of the Audit Table
+
+  ReportBucketName:
+    Value: !Ref ReportBucket
+    Description: Name of the S3 bucket for reports
+
+  AuditReportCompleteTopicArn:
+    Value: !Ref AuditReportCompleteTopic
+    Description: ARN of the Audit Report Complete SNS Topic
+
+  EventBridgeSchedulerName:
+    Value: !Ref CertificateProcessingSchedule
+    Description: Name of the EventBridge Scheduler
+
+  ApiGatewayEndpoint:
+    Value: !Sub 'https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/prod/'
+    Description: URL of the API Gateway
