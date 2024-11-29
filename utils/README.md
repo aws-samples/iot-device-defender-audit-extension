@@ -1,4 +1,4 @@
-# AWS IoT Certificate Manager (for testing) and Sample lambda
+# AWS IoT Certificate Manager (for testing) and Sample Lambda
 
 This folder contains two Python scripts:
 1. `cert_manager.py`
