@@ -2,7 +2,7 @@
 
 This folder contains two Python scripts:
 1. `cert_manager.py`
-2. `retained_message_publish_lambda.py`
+2. `rotation_message_publish_lambda.py`
 
 ## cert_manager.py
 
@@ -47,9 +47,9 @@ Before running these scripts, make sure you have the following:
 
 - Additionally, for `cert_manager.py`, you'll need permissions to create, update, and delete certificates in AWS IoT.
 
-## retained_message_publish_lambda.py
+## rotation_message_publish_lambda.py
 
-`retained_message_publish_lambda.py` is a sample lambda function that showcases how to make use of the notification coming the last leg of the architecture. 
+`rotation_message_publish_lambda.py` is a sample lambda function that showcases how to make use of the notification coming the last leg of the architecture. 
 
 In the script you can see how we can integrate this solution into already existing code that makes use of Device Defender Audit for certificate rotation. Here is a sample of that section in the code
 
