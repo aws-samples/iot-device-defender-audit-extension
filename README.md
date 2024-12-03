@@ -65,7 +65,7 @@ Before getting started, ensure you have the following:
 
 ## Installation
 
-1. Download the CloudForamtion template from `src/iot_dd_audit_upgrade.yml`
+1. Download the CloudForamtion template from [`src/iot_dd_audit_upgrade.yml`](https://github.com/aws-samples/iot-device-defender-audit-extension/blob/main/src/iot_dd_audit_upgrade.yml)
 
 2. Upload ClouFormation Template to the CloudFormation Console, set the values, and deploy
 
