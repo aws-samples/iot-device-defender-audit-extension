@@ -24,7 +24,9 @@ The solution provides following two configuration options:
 
 1. Alert on ‘duration in use’  -  Audit and report if a certificate has been in use for ‘n’ days. This is useful in scenarios where the ask is to use long validity certificates (5 - 15 yrs) but rotate them periodically (say after every year) eg automotive use cases where a vehicle can remain offline for an extended period of time and the certificate might expire before there is an opportunity to rotate that.
 
-2. Alert on ‘time to expire’ - Notify ‘n’ days ahead of expiry of certificate. With this option, customers get flexibility to define a duration that fits their use case, eg automotive customers want the notification 6 months to 1 yr in advance while there are customers who want notification just a few days in advance of expiry of certificates. 
+2. Alert on ‘time to expire’ - Notify ‘n’ days ahead of expiry of certificate. With this option, customers get flexibility to define a duration that fits their use case, eg automotive customers want the notification 6 months to 1 yr in advance while there are customers who want notification just a few days in advance of expiry of certificates.
+
+[Device certificate expiring](https://docs.aws.amazon.com/iot-device-defender/latest/devguide/audit-chk-device-cert-approaching-expiration.html) check of [AWS IoT Device Defender - Audit](https://docs.aws.amazon.com/iot-device-defender/latest/devguide/device-defender-audit.html) (DD) provides the same capability but currently the alert window is fixed to 30 days before expiration of the certificate. This project provides an alternate solution for use cases where 30 day window is a limitation. Efforts have been made to keep the implementation close to DD so that in future if DD has this functionality, it's easier for customers to migrate to DD. 
 
 ## Key Features
 
