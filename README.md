@@ -17,7 +17,14 @@
 
 ## Overview
 
-This project provides an AWS-based solution for managing and auditing IoT device certificates. It offers an automated, scalable approach to process certificates, store audit information, and generate compliance reports. The solution is designed to help organizations maintain security and compliance in their IoT ecosystems by keeping track of certificate lifecycles and identifying potential risks.
+This project provides a solution for auditing IoT device certificates using AWS services. It offers an automated, scalable and cost efficient solution to audit IoT device certificates and generate report for certificates which are candidates for rotation and raises alert which can be utilized to trigger the certificate rotation pipeline. The solution is designed to help organizations maintain security and compliance in their IoT ecosystems by keeping track of certificate lifecycles and identifying potential risks.
+
+The solution provides following two configuration options:  
+
+
+1. Alert on ‘duration in use’  -  Audit and report if a certificate has been in use for ‘n’ days. This is required by Automotive customers who prefer to use long validity certificates (5 - 15 yrs) but rotate them periodically (say after every year)
+
+2. Alert on ‘time to expire’ - Notify ‘n’ days ahead of expiry of certificate. With this option, customers get flexibility to define a duration that fits their use case, eg Automotive customers want the notification 6 months to 1 yr in advance while there are customers who want notification just a few days in advance of expiry of certificates. 
 
 ## Key Features
 
