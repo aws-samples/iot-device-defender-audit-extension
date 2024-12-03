@@ -17,7 +17,7 @@
 
 ## Overview
 
-This project provides a solution for auditing IoT device certificates using AWS services. It offers an automated, scalable and cost efficient solution to audit IoT device certificates. It also generates report for certificates which are candidate for rotation and raises alert that may be used to start the certificate rotation pipeline. The solution is designed to help organizations maintain security and compliance in their IoT ecosystems by keeping track of certificate lifecycle.
+This project provides a solution for auditing IoT device certificates using AWS services. It offers an automated, scalable and cost efficient solution to audit IoT device certificates registered in [AWS IoT Core Registry](#https://docs.aws.amazon.com/iot/latest/developerguide/thing-registry.html). It also generates report for certificates which are candidate for rotation and raises alert that may be used to start the certificate rotation pipeline. The solution is designed to help organizations maintain security and compliance in their IoT ecosystems by keeping track of certificate lifecycle.
 
 The solution provides following two configuration options:  
 
