@@ -65,13 +65,15 @@ Before getting started, ensure you have the following:
 
 ## Installation
 
-1. Download the CloudForamtion template from [`src/iot_dd_audit_upgrade.yml`](https://github.com/aws-samples/iot-device-defender-audit-extension/blob/main/src/iot_dd_audit_upgrade.yml)
+1. Download the CloudForamtion template from [`src/iot_dd_audit_upgrade.yml`](https://github.com/aws-samples/iot-device-defender-audit-extension/blob/main/src/iot_dd_audit_upgrade.yml) to local device
 
-2. Upload ClouFormation Template to the CloudFormation Console, set the values, and deploy
+2. In your AWS account, go to CloudFormation console, click on 'create stack' and select 'With new resources (standard)'
+  
+4. Upload ClouFormation template from local device to the CloudFormation Console, set the values, and deploy
 
-3. Once deployed, the system will automatically start processing certificates and generating audit reports based on the configured schedule. Alternatively you can make use of API GW APIs to interact with the solution.
+5. Once deployed, the solution will automatically start processing certificates and generating audit reports based on the default schedule configured in Event Bridge by the cloudformation template. You can use the REST API (described later in the document) or Event Bridge console to change the default schedule.
 
-4. Vailidate the Cloudformation Teamplate execution in the Cloudformation console.
+6. Vailidate the Cloudformation teamplate execution in the Cloudformation console.
 
 
 ## Components
