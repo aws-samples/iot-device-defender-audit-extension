@@ -31,14 +31,14 @@ The solution provides following two configuration options:
 ## Key Features
 
 - Automated listing and processing of IoT certificates
-- Storage of certificate details in Amazon DynamoDB
+- Storage of certificate details in [Amazon DynamoDB](https://aws.amazon.com/pm/dynamodb/)
 - Generation of audit reports for expiring or expired certificates
 - RESTful API for interacting with the system
 - Scalable architecture using AWS serverless services
-- Scheduled execution using Amazon EventBridge
-- Efficient processing using Amazon SQS for task distribution
-- Notification system using Amazon SNS
-- Secure storage of audit reports in Amazon S3
+- Scheduled execution using [Amazon EventBridge](https://aws.amazon.com/eventbridge/)
+- Efficient processing using [Amazon SQS](https://aws.amazon.com/sqs/) for task distribution
+- Notification system using [Amazon SNS](https://aws.amazon.com/sns/)
+- Secure storage of audit reports in [Amazon S3](https://aws.amazon.com/s3/)
 
 ## Architecture
 
@@ -46,8 +46,8 @@ The solution provides following two configuration options:
 
 The solution leverages several AWS services to create a robust and scalable architecture:
 
-- Amazon API Gateway for creating and managing APIs
-- AWS Lambda for certificate processing and audit report generation
+- [Amazon API Gateway](https://aws.amazon.com/api-gateway/) for creating and managing APIs
+- [AWS Lambda](https://aws.amazon.com/lambda/) for certificate processing and audit report generation
 - Amazon DynamoDB for storing certificate and audit data
 - Amazon S3 for storing audit reports
 - Amazon SQS for queuing certificate processing tasks
@@ -59,7 +59,7 @@ The solution leverages several AWS services to create a robust and scalable arch
 Before getting started, ensure you have the following:
 
 - An AWS account with appropriate permissions
-- AWS CLI installed and configured with your credentials
+- [AWS CLI](https://aws.amazon.com/cli/) installed and configured with your credentials
 - Python 3.7 or later installed on your local machine
 - Git for cloning the repository
 
